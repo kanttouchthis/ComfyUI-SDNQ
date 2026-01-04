@@ -7,8 +7,7 @@ from comfy.model_management import unload_all_models
 import folder_paths
 
 import torch
-from sdnq.quantizer import SDNQDequantizer
-from sdnq.layers.linear.linear_int8 import quantized_linear_forward_int8_matmul
+from hqqsvd.linear import HQQSVDLinear
 
 # Get log level from environment variable (default to INFO)
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -21,61 +20,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class SDNQLinear(torch.nn.Module):
-    def __init__(self, compute_dtype=torch.bfloat16):
-        super().__init__()
-        self.compute_dtype = compute_dtype
-
-    @torch.no_grad()
-    def load_state_dict(self, state_dict):
-        self.weight = state_dict["weight"]
-        self.bias = state_dict["bias"]
-        self.svd_up = state_dict["svd_up"].t()
-        self.svd_down = state_dict["svd_down"].t()
-        self.zero_point = state_dict["zero_point"]
-        self.scale = state_dict["scale"]
-        self._shape = torch.Size(list(state_dict["shape"]))
-        out_features = self.svd_down.shape[0]
-        in_features = self.svd_up.shape[1]
-        svd_rank = self.svd_down.shape[1]
-        # not sure about the inputs here
-        self.sdnq_dequantizer = SDNQDequantizer(
-            self.compute_dtype,
-            (in_features, out_features),
-            (in_features, out_features),
-            (in_features, 1),
-            self._shape,
-            "uint4",  # hardcoded for now
-            "int8",
-            0,
-            svd_rank,
-            8,
-            True,
-            True,
-            False,
-            "linear",
-        )
-
-    def forward(self, x):
-        return quantized_linear_forward_int8_matmul(self, x)
-
-
 def replace_linear(model, new_sd, compute_dtype, prefix=""):
     for name, module in model.named_children():
         if (f"{prefix}.{name}.svd_up") in new_sd:
-            sd = {
-                "weight": new_sd.pop(f"{prefix}.{name}.weight"),
-                "bias": new_sd.pop(f"{prefix}.{name}.bias"),
-                "svd_up": new_sd.pop(f"{prefix}.{name}.svd_up"),
-                "svd_down": new_sd.pop(f"{prefix}.{name}.svd_down"),
-                "zero_point": new_sd.pop(f"{prefix}.{name}.zero_point"),
-                "scale": new_sd.pop(f"{prefix}.{name}.scale"),
-                "shape": new_sd.pop(f"{prefix}.{name}.shape"),
-            }
-            sd = {k: v.cuda() if hasattr(v, "cuda") else v for k, v in sd.items()}
+            W_q = new_sd.pop(f"{prefix}.{name}.weight").cuda()
+            svd_up = new_sd.pop(f"{prefix}.{name}.svd_up").cuda()
+            svd_down = new_sd.pop(f"{prefix}.{name}.svd_down").cuda()
+            zero_point = new_sd.pop(f"{prefix}.{name}.zero_point").cuda()
+            bias = new_sd.pop(f"{prefix}.{name}.bias").cuda()
+            scale = new_sd.pop(f"{prefix}.{name}.scale").cuda()
+            nbits = new_sd.pop(f"{prefix}.{name}.nbits", torch.tensor([4]))
+            # remove legacy shape
+            if new_sd.pop(f"{prefix}.{name}.shape", None) is not None:
+                pass
 
-            sdnq_linear = SDNQLinear(compute_dtype)
-            sdnq_linear.load_state_dict(sd)
+            sdnq_linear = HQQSVDLinear(W_q, svd_up, svd_down, scale, zero_point, bias, nbits.item())
             setattr(model, name, sdnq_linear)
             torch.cuda.empty_cache()
         else:
