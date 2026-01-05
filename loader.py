@@ -5,10 +5,12 @@ import comfy.utils
 import comfy.lora
 from comfy import model_detection, model_management
 from comfy.model_management import unload_all_models
+from comfy.model_patcher import string_to_seed, get_key_weight
 import folder_paths
 
 import torch
-from hqqsvd.linear import HQQSVDLinear, Lora
+import collections
+from hqqsvd.linear import HQQSVDLinear, ComfyLora
 
 # Get log level from environment variable (default to INFO)
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -49,25 +51,53 @@ def replace_linear(model, new_sd, compute_dtype, int8_matmul, prefix=""):
             replace_linear(module, new_sd, compute_dtype, int8_matmul, sub_prefix)
     return model
 
-def apply_lora(model, lora_name, loaded, strength, prefix=""):
-    for name, module in model.named_children():
-        base = f"{prefix}.{name}"
-        if (base + ".weight") in loaded and isinstance(module, HQQSVDLinear):
-            comfy_lora = loaded.pop(base + ".weight")
-            compute_dtype = module.scale.dtype
-            lora_up = comfy_lora.weights[0].to("cuda", compute_dtype)
-            lora_down = comfy_lora.weights[1].to("cuda", compute_dtype)
-            alpha = comfy_lora.weights[2]
-            lora = Lora(name, lora_up, lora_down, alpha, strength)
-            module.add_lora(lora)
-        else:
-            if prefix == "":
-                sub_prefix = name
-            else:
-                sub_prefix = prefix + "." + name
-            apply_lora(module, lora_name, loaded, strength, sub_prefix)
-    return model
 
+class CustomPatcher(comfy.model_patcher.ModelPatcher):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    
+    def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
+        if key not in self.patches:
+            return
+
+        weight, set_func, convert_func = get_key_weight(self.model, key)
+        inplace_update = self.weight_inplace_update or inplace_update
+
+        if weight.dtype == torch.uint8:
+            sdnq_linear = self.model.get_submodule(key.rstrip(".weight"))
+            for i, p in enumerate(self.patches[key]):
+                k = f"{key}|{i}"
+                lora = ComfyLora(k, p, comfy.lora.calculate_weight)
+                sdnq_linear.add_lora(lora)
+            return
+
+        if key not in self.backup:
+            self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
+
+        temp_dtype = comfy.model_management.lora_compute_dtype(device_to)
+        if device_to is not None:
+            temp_weight = comfy.model_management.cast_to_device(weight, device_to, temp_dtype, copy=True)
+        else:
+            temp_weight = weight.to(temp_dtype, copy=True)
+        if convert_func is not None:
+            temp_weight = convert_func(temp_weight, inplace=True)
+
+        out_weight = comfy.lora.calculate_weight(self.patches[key], temp_weight, key)
+        if set_func is None:
+            out_weight = comfy.float.stochastic_rounding(out_weight, weight.dtype, seed=string_to_seed(key))
+            if inplace_update:
+                comfy.utils.copy_to_param(self.model, key, out_weight)
+            else:
+                comfy.utils.set_attr_param(self.model, key, out_weight)
+        else:
+            set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
+
+    def unpatch_model(self, device_to=None, unpatch_weights=True):
+        if unpatch_weights:
+            for module in self.model.modules():
+                if isinstance(module, HQQSVDLinear):
+                    module.loras = {}
+        return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
 
 def load_diffusion_model_state_dict(sd, int8_matmul, model_options={}, metadata=None):
     """
@@ -169,7 +199,7 @@ def load_diffusion_model_state_dict(sd, int8_matmul, model_options={}, metadata=
     left_over = sd.keys()
     if len(left_over) > 0:
         logging.info("left over keys in diffusion model: {}".format(left_over))
-    return comfy.model_patcher.ModelPatcher(
+    return CustomPatcher(
         model, load_device=load_device, offload_device=offload_device
     )
 
@@ -215,31 +245,5 @@ class SDNQLoader:
         unload_all_models()
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
         model = load_diffusion_model(unet_path, int8_matmul)
-        return (model,)
-
-
-class SDNQLoraLoader:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "lora_name": (folder_paths.get_filename_list("loras"),),
-                "strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01,})
-            }
-        }
-
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION = "load_lora"
-
-    CATEGORY = "SDNQ"
-
-    def load_lora(self, model, lora_name, strength):
-        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
-        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-        key_map = comfy.lora.model_lora_keys_unet(model.model, {})
-        lora = comfy.lora_convert.convert_lora(lora)
-        loaded = comfy.lora.load_lora(lora, key_map)
-        model.model = apply_lora(model.model, lora_name, loaded, strength)
         return (model,)
 
