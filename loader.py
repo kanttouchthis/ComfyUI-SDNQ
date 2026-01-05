@@ -2,12 +2,13 @@ import logging
 import os
 
 import comfy.utils
+import comfy.lora
 from comfy import model_detection, model_management
 from comfy.model_management import unload_all_models
 import folder_paths
 
 import torch
-from hqqsvd.linear import HQQSVDLinear
+from hqqsvd.linear import HQQSVDLinear, Lora
 
 # Get log level from environment variable (default to INFO)
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -20,9 +21,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def replace_linear(model, new_sd, compute_dtype, prefix=""):
+def replace_linear(model, new_sd, compute_dtype, int8_matmul, prefix=""):
     for name, module in model.named_children():
-        if (f"{prefix}.{name}.svd_up") in new_sd:
+        base = f"{prefix}.{name}"
+        if (base + ".svd_up") in new_sd:
             W_q = new_sd.pop(f"{prefix}.{name}.weight").to("cuda")
             svd_up = new_sd.pop(f"{prefix}.{name}.svd_up").to("cuda", compute_dtype)
             svd_down = new_sd.pop(f"{prefix}.{name}.svd_down").to("cuda", compute_dtype)
@@ -34,7 +36,7 @@ def replace_linear(model, new_sd, compute_dtype, prefix=""):
             if new_sd.pop(f"{prefix}.{name}.shape", None) is not None:
                 pass
 
-            sdnq_linear = HQQSVDLinear(W_q, svd_up, svd_down, scale, zero_point, bias, nbits.item())
+            sdnq_linear = HQQSVDLinear(W_q, svd_up, svd_down, scale, zero_point, bias, nbits.item(), int8_matmul=int8_matmul)
             setattr(model, name, sdnq_linear)
             torch.cuda.empty_cache()
         else:
@@ -44,11 +46,30 @@ def replace_linear(model, new_sd, compute_dtype, prefix=""):
                 sub_prefix = name
             else:
                 sub_prefix = prefix + "." + name
-            replace_linear(module, new_sd, compute_dtype, sub_prefix)
+            replace_linear(module, new_sd, compute_dtype, int8_matmul, sub_prefix)
+    return model
+
+def apply_lora(model, lora_name, loaded, strength, prefix=""):
+    for name, module in model.named_children():
+        base = f"{prefix}.{name}"
+        if (base + ".weight") in loaded and isinstance(module, HQQSVDLinear):
+            comfy_lora = loaded.pop(base + ".weight")
+            compute_dtype = module.scale.dtype
+            lora_up = comfy_lora.weights[0].to("cuda", compute_dtype)
+            lora_down = comfy_lora.weights[1].to("cuda", compute_dtype)
+            alpha = comfy_lora.weights[2]
+            lora = Lora(name, lora_up, lora_down, alpha, strength)
+            module.add_lora(lora)
+        else:
+            if prefix == "":
+                sub_prefix = name
+            else:
+                sub_prefix = prefix + "." + name
+            apply_lora(module, lora_name, loaded, strength, sub_prefix)
     return model
 
 
-def load_diffusion_model_state_dict(sd, model_options={}, metadata=None):
+def load_diffusion_model_state_dict(sd, int8_matmul, model_options={}, metadata=None):
     """
     Loads a UNet diffusion model from a state dictionary, supporting both diffusers and regular formats.
 
@@ -142,7 +163,7 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None):
         model_config.optimizations["fp8"] = True
 
     model = model_config.get_model(new_sd, "")
-    model = replace_linear(model, new_sd, unet_dtype)
+    model = replace_linear(model, new_sd, unet_dtype, int8_matmul)
     model = model.to(offload_device)
     model.load_model_weights(new_sd, "")
     left_over = sd.keys()
@@ -160,10 +181,10 @@ def model_detection_error_hint(path, state_dict):
     return ""
 
 
-def load_diffusion_model(unet_path, model_options={}):
+def load_diffusion_model(unet_path, int8_matmul, model_options={}):
     sd, metadata = comfy.utils.load_torch_file(unet_path, return_metadata=True)
     model = load_diffusion_model_state_dict(
-        sd, model_options=model_options, metadata=metadata
+        sd, int8_matmul, model_options=model_options, metadata=metadata
     )
     if model is None:
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
@@ -181,6 +202,7 @@ class SDNQLoader:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
+                "int8_matmul": ("BOOLEAN", {"default":True})
             }
         }
 
@@ -189,8 +211,35 @@ class SDNQLoader:
 
     CATEGORY = "SDNQ"
 
-    def load_unet(self, unet_name):
+    def load_unet(self, unet_name, int8_matmul:bool=True):
         unload_all_models()
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
-        model = load_diffusion_model(unet_path)
+        model = load_diffusion_model(unet_path, int8_matmul)
         return (model,)
+
+
+class SDNQLoraLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "strength": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01,})
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load_lora"
+
+    CATEGORY = "SDNQ"
+
+    def load_lora(self, model, lora_name, strength):
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        key_map = comfy.lora.model_lora_keys_unet(model.model, {})
+        lora = comfy.lora_convert.convert_lora(lora)
+        loaded = comfy.lora.load_lora(lora, key_map)
+        model.model = apply_lora(model.model, lora_name, loaded, strength)
+        return (model,)
+
