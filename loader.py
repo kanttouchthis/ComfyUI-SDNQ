@@ -27,18 +27,12 @@ def replace_linear(model, new_sd, compute_dtype, int8_matmul, prefix=""):
     for name, module in model.named_children():
         base = f"{prefix}.{name}"
         if (base + ".svd_up") in new_sd:
-            W_q = new_sd.pop(f"{prefix}.{name}.weight").to("cuda")
-            svd_up = new_sd.pop(f"{prefix}.{name}.svd_up").to("cuda", compute_dtype)
-            svd_down = new_sd.pop(f"{prefix}.{name}.svd_down").to("cuda", compute_dtype)
-            zero_point = new_sd.pop(f"{prefix}.{name}.zero_point").to("cuda", compute_dtype)
-            bias = new_sd.pop(f"{prefix}.{name}.bias").to("cuda", compute_dtype)
-            scale = new_sd.pop(f"{prefix}.{name}.scale").to("cuda", compute_dtype)
-            nbits = new_sd.pop(f"{prefix}.{name}.nbits", torch.tensor([4]))
-            # remove legacy shape
-            if new_sd.pop(f"{prefix}.{name}.shape", None) is not None:
-                pass
-
-            sdnq_linear = HQQSVDLinear(W_q, svd_up, svd_down, scale, zero_point, bias, nbits.item(), int8_matmul=int8_matmul)
+            out_features, in_features = module.weight.shape
+            svd_rank = new_sd[base + ".svd_up"].shape[1]
+            n_groups = new_sd[base + ".scale"].shape[1]
+            nbits = new_sd[base + ".nbits"].item()
+            bias = (base + ".bias") in new_sd
+            sdnq_linear = HQQSVDLinear(in_features, out_features, svd_rank, n_groups, nbits, int8_matmul, bias, "cuda", dtype=compute_dtype)
             setattr(model, name, sdnq_linear)
             torch.cuda.empty_cache()
         else:
